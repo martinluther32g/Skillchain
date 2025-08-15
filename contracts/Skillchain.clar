@@ -14,6 +14,14 @@
 (define-constant ERR_ALREADY_VERIFIED (err u112))
 (define-constant ERR_INVALID_CHALLENGE_DURATION (err u113))
 (define-constant ERR_CHALLENGE_ALREADY_COMPLETED (err u114))
+(define-constant ERR_MENTORSHIP_NOT_FOUND (err u115))
+(define-constant ERR_NOT_QUALIFIED_MENTOR (err u116))
+(define-constant ERR_ALREADY_ENROLLED (err u117))
+(define-constant ERR_NOT_ENROLLED (err u118))
+(define-constant ERR_MODULE_NOT_FOUND (err u119))
+(define-constant ERR_MODULE_NOT_COMPLETED (err u120))
+(define-constant ERR_PROGRAM_COMPLETED (err u121))
+(define-constant ERR_INSUFFICIENT_PROGRESS (err u122))
 
 (define-fungible-token skill-token)
 
@@ -22,6 +30,7 @@
 (define-data-var token-decimals uint u6)
 (define-data-var next-skill-id uint u1)
 (define-data-var next-challenge-id uint u1)
+(define-data-var next-mentorship-id uint u1)
 
 (define-map users principal {
     reputation-score: uint,
@@ -81,6 +90,54 @@
     participant: principal,
     final-score: uint,
     reward-earned: uint
+})
+
+;; Mentorship program data structures
+(define-map mentorship-programs uint {
+    mentor: principal,
+    skill-id: uint,
+    title: (string-ascii 100),
+    description: (string-ascii 300),
+    total-modules: uint,
+    program-fee: uint,
+    mentor-share: uint,
+    duration-weeks: uint,
+    created-at: uint,
+    active: bool,
+    total-students: uint,
+    completion-rate: uint
+})
+
+(define-map mentorship-modules {program-id: uint, module-number: uint} {
+    title: (string-ascii 80),
+    content: (string-ascii 400),
+    requirements: (string-ascii 200),
+    estimated-hours: uint
+})
+
+(define-map student-enrollments {program-id: uint, student: principal} {
+    enrolled-at: uint,
+    current-module: uint,
+    modules-completed: uint,
+    total-progress: uint,
+    status: (string-ascii 20),
+    mentor-rating: uint,
+    completion-timestamp: uint
+})
+
+(define-map module-completions {program-id: uint, student: principal, module-number: uint} {
+    completed-at: uint,
+    mentor-approved: bool,
+    submission: (string-ascii 300),
+    mentor-feedback: (string-ascii 200)
+})
+
+(define-map skill-certificates {student: principal, program-id: uint} {
+    issued-at: uint,
+    mentor: principal,
+    skill-id: uint,
+    final-score: uint,
+    certificate-hash: (string-ascii 64)
 })
 
 (define-public (initialize)
@@ -502,3 +559,255 @@
         u0
     )
 )
+
+;; Create a mentorship program for a specific skill
+(define-public (create-mentorship-program (skill-id uint) (title (string-ascii 100)) (description (string-ascii 300)) (total-modules uint) (program-fee uint) (mentor-share uint) (duration-weeks uint))
+    (let (
+        (program-id (var-get next-mentorship-id))
+        (mentor tx-sender)
+        (skill-data (unwrap! (map-get? skills skill-id) ERR_SKILL_NOT_FOUND))
+        (mentor-reputation (calculate-reputation-score mentor))
+    )
+        ;; Validate mentor qualification - must have high reputation and own the skill
+        (asserts! (is-eq (get owner skill-data) mentor) ERR_NOT_QUALIFIED_MENTOR)
+        (asserts! (>= mentor-reputation u50) ERR_NOT_QUALIFIED_MENTOR)
+        (asserts! (> total-modules u0) ERR_INVALID_AMOUNT)
+        (asserts! (<= total-modules u20) ERR_INVALID_AMOUNT)
+        (asserts! (> duration-weeks u0) ERR_INVALID_AMOUNT)
+        (asserts! (<= mentor-share u80) ERR_INVALID_AMOUNT)
+        (asserts! (> (len title) u0) ERR_INVALID_AMOUNT)
+        
+        (map-set mentorship-programs program-id {
+            mentor: mentor,
+            skill-id: skill-id,
+            title: title,
+            description: description,
+            total-modules: total-modules,
+            program-fee: program-fee,
+            mentor-share: mentor-share,
+            duration-weeks: duration-weeks,
+            created-at: stacks-block-height,
+            active: true,
+            total-students: u0,
+            completion-rate: u0
+        })
+        
+        (var-set next-mentorship-id (+ program-id u1))
+        (ok program-id)
+    )
+)
+
+;; Add learning modules to a mentorship program
+(define-public (add-mentorship-module (program-id uint) (module-number uint) (title (string-ascii 80)) (content (string-ascii 400)) (requirements (string-ascii 200)) (estimated-hours uint))
+    (let (
+        (program-data (unwrap! (map-get? mentorship-programs program-id) ERR_MENTORSHIP_NOT_FOUND))
+        (mentor (get mentor program-data))
+    )
+        (asserts! (is-eq tx-sender mentor) ERR_NOT_AUTHORIZED)
+        (asserts! (<= module-number (get total-modules program-data)) ERR_INVALID_AMOUNT)
+        (asserts! (> (len title) u0) ERR_INVALID_AMOUNT)
+        (asserts! (> estimated-hours u0) ERR_INVALID_AMOUNT)
+        
+        (map-set mentorship-modules {program-id: program-id, module-number: module-number} {
+            title: title,
+            content: content,
+            requirements: requirements,
+            estimated-hours: estimated-hours
+        })
+        
+        (ok true)
+    )
+)
+
+;; Enroll student in mentorship program
+(define-public (enroll-in-mentorship (program-id uint))
+    (let (
+        (student tx-sender)
+        (program-data (unwrap! (map-get? mentorship-programs program-id) ERR_MENTORSHIP_NOT_FOUND))
+        (enrollment-key {program-id: program-id, student: student})
+        (program-fee (get program-fee program-data))
+    )
+        (asserts! (get active program-data) ERR_MENTORSHIP_NOT_FOUND)
+        (asserts! (is-none (map-get? student-enrollments enrollment-key)) ERR_ALREADY_ENROLLED)
+        (asserts! (>= (ft-get-balance skill-token student) program-fee) ERR_INSUFFICIENT_TOKENS)
+        
+        ;; Transfer program fee to contract
+        (if (> program-fee u0)
+            (try! (ft-transfer? skill-token program-fee student (as-contract tx-sender)))
+            true
+        )
+        
+        ;; Create enrollment record
+        (map-set student-enrollments enrollment-key {
+            enrolled-at: stacks-block-height,
+            current-module: u1,
+            modules-completed: u0,
+            total-progress: u0,
+            status: "active",
+            mentor-rating: u0,
+            completion-timestamp: u0
+        })
+        
+        ;; Update program student count
+        (map-set mentorship-programs program-id (merge program-data {
+            total-students: (+ (get total-students program-data) u1)
+        }))
+        
+        (ok true)
+    )
+)
+
+;; Submit module completion for mentor review
+(define-public (submit-module-completion (program-id uint) (module-number uint) (submission (string-ascii 300)))
+    (let (
+        (student tx-sender)
+        (enrollment-key {program-id: program-id, student: student})
+        (enrollment-data (unwrap! (map-get? student-enrollments enrollment-key) ERR_NOT_ENROLLED))
+        (completion-key {program-id: program-id, student: student, module-number: module-number})
+    )
+        (asserts! (is-eq (get status enrollment-data) "active") ERR_PROGRAM_COMPLETED)
+        (asserts! (is-eq (get current-module enrollment-data) module-number) ERR_MODULE_NOT_FOUND)
+        (asserts! (is-some (map-get? mentorship-modules {program-id: program-id, module-number: module-number})) ERR_MODULE_NOT_FOUND)
+        (asserts! (> (len submission) u0) ERR_INVALID_AMOUNT)
+        
+        (map-set module-completions completion-key {
+            completed-at: stacks-block-height,
+            mentor-approved: false,
+            submission: submission,
+            mentor-feedback: ""
+        })
+        
+        (ok true)
+    )
+)
+
+;; Mentor approves student module completion
+(define-public (approve-module-completion (program-id uint) (student principal) (module-number uint) (feedback (string-ascii 200)))
+    (let (
+        (mentor tx-sender)
+        (program-data (unwrap! (map-get? mentorship-programs program-id) ERR_MENTORSHIP_NOT_FOUND))
+        (enrollment-key {program-id: program-id, student: student})
+        (enrollment-data (unwrap! (map-get? student-enrollments enrollment-key) ERR_NOT_ENROLLED))
+        (completion-key {program-id: program-id, student: student, module-number: module-number})
+        (completion-data (unwrap! (map-get? module-completions completion-key) ERR_MODULE_NOT_FOUND))
+    )
+        (asserts! (is-eq mentor (get mentor program-data)) ERR_NOT_AUTHORIZED)
+        (asserts! (not (get mentor-approved completion-data)) ERR_MODULE_NOT_COMPLETED)
+        
+        ;; Mark module as approved
+        (map-set module-completions completion-key (merge completion-data {
+            mentor-approved: true,
+            mentor-feedback: feedback
+        }))
+        
+        ;; Update student progress
+        (let (
+            (new-modules-completed (+ (get modules-completed enrollment-data) u1))
+            (new-current-module (+ module-number u1))
+            (total-modules (get total-modules program-data))
+            (new-progress (/ (* new-modules-completed u100) total-modules))
+        )
+            (map-set student-enrollments enrollment-key (merge enrollment-data {
+                current-module: (if (<= new-current-module total-modules) new-current-module module-number),
+                modules-completed: new-modules-completed,
+                total-progress: new-progress,
+                status: (if (is-eq new-modules-completed total-modules) "completed" "active")
+            }))
+            
+            ;; Issue certificate if program completed
+            (if (is-eq new-modules-completed total-modules)
+                (try! (issue-skill-certificate program-id student))
+                true
+            )
+            (ok true)
+        )
+    )
+)
+
+;; Issue skill certificate upon program completion
+(define-private (issue-skill-certificate (program-id uint) (student principal))
+    (let (
+        (program-data (unwrap! (map-get? mentorship-programs program-id) ERR_MENTORSHIP_NOT_FOUND))
+        (enrollment-data (unwrap! (map-get? student-enrollments {program-id: program-id, student: student}) ERR_NOT_ENROLLED))
+        (certificate-key {student: student, program-id: program-id})
+        (final-score (get total-progress enrollment-data))
+        (mentor (get mentor program-data))
+        (skill-id (get skill-id program-data))
+    )
+        (map-set skill-certificates certificate-key {
+            issued-at: stacks-block-height,
+            mentor: mentor,
+            skill-id: skill-id,
+            final-score: final-score,
+            certificate-hash: "hash-placeholder"
+        })
+        
+        ;; Update completion timestamp
+        (map-set student-enrollments {program-id: program-id, student: student} (merge enrollment-data {
+            completion-timestamp: stacks-block-height
+        }))
+        
+        ;; Distribute payment to mentor
+        (try! (distribute-mentorship-payment program-id))
+        (ok true)
+    )
+)
+
+;; Distribute payment between platform and mentor
+(define-private (distribute-mentorship-payment (program-id uint))
+    (let (
+        (program-data (unwrap! (map-get? mentorship-programs program-id) ERR_MENTORSHIP_NOT_FOUND))
+        (mentor (get mentor program-data))
+        (program-fee (get program-fee program-data))
+        (mentor-share-percent (get mentor-share program-data))
+        (mentor-payment (/ (* program-fee mentor-share-percent) u100))
+        (platform-fee (- program-fee mentor-payment))
+    )
+        ;; Pay mentor
+        (as-contract (try! (ft-transfer? skill-token mentor-payment tx-sender mentor)))
+        ;; Keep platform fee in contract
+        (ok true)
+    )
+)
+
+;; Read-only functions for mentorship system
+(define-read-only (get-mentorship-program (program-id uint))
+    (map-get? mentorship-programs program-id)
+)
+
+(define-read-only (get-mentorship-module (program-id uint) (module-number uint))
+    (map-get? mentorship-modules {program-id: program-id, module-number: module-number})
+)
+
+(define-read-only (get-student-enrollment (program-id uint) (student principal))
+    (map-get? student-enrollments {program-id: program-id, student: student})
+)
+
+(define-read-only (get-module-completion (program-id uint) (student principal) (module-number uint))
+    (map-get? module-completions {program-id: program-id, student: student, module-number: module-number})
+)
+
+(define-read-only (get-skill-certificate (student principal) (program-id uint))
+    (map-get? skill-certificates {student: student, program-id: program-id})
+)
+
+(define-read-only (get-next-mentorship-id)
+    (var-get next-mentorship-id)
+)
+
+(define-read-only (calculate-program-completion-rate (program-id uint))
+    (match (map-get? mentorship-programs program-id)
+        program-data 
+        (let (
+            (total-students (get total-students program-data))
+        )
+            (if (> total-students u0)
+                (/ (* (get completion-rate program-data) u100) total-students)
+                u0
+            )
+        )
+        u0
+    )
+)
+
+
